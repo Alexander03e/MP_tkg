@@ -6,6 +6,8 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
+import { ControlPanel } from './components/ControlPanel';
+import { createWaveShaderMaterial } from './shaders/waveShader';
 import './App.css';
 
 interface SceneObject {
@@ -391,15 +393,30 @@ function App() {
     sphere.userData.id = 'sphere';
     scene.add(sphere);
 
+    // Плоскость с кастомным GLSL шейдером (волновой эффект)
+    const shaderPlaneGeometry = new THREE.PlaneGeometry(3, 3, 50, 50);
+    const shaderMaterial = createWaveShaderMaterial();
+    const shaderPlane = new THREE.Mesh(shaderPlaneGeometry, shaderMaterial);
+    shaderPlane.rotation.x = -Math.PI / 2;
+    shaderPlane.position.set(0, 0.5, -3);
+    shaderPlane.castShadow = true;
+    shaderPlane.receiveShadow = true;
+    shaderPlane.userData.selectable = true;
+    shaderPlane.userData.id = 'shader-plane';
+    shaderPlane.userData.isShader = true;
+    scene.add(shaderPlane);
+
     // Инициализация объектов
     const objects = new Map<string, SceneObject>();
     const pyramidObj = { id: 'pyramid', name: 'Пирамида', mesh: pyramid };
     const cubeObj = { id: 'cube', name: 'Куб', mesh: cube };
     const sphereObj = { id: 'sphere', name: 'Сфера', mesh: sphere };
+    const shaderPlaneObj = { id: 'shader-plane', name: 'Волновая плоскость (GLSL)', mesh: shaderPlane };
     
     objects.set('pyramid', pyramidObj);
     objects.set('cube', cubeObj);
     objects.set('sphere', sphereObj);
+    objects.set('shader-plane', shaderPlaneObj);
 
     sceneRef.current = {
       scene,
@@ -417,7 +434,7 @@ function App() {
     
     // Обновляем список объектов после монтирования
     queueMicrotask(() => {
-      setSceneObjects([pyramidObj, cubeObj, sphereObj]);
+      setSceneObjects([pyramidObj, cubeObj, sphereObj, shaderPlaneObj]);
     });
 
     // Обработка кликов по объектам
@@ -451,8 +468,17 @@ function App() {
     renderer.domElement.addEventListener('click', handleClick);
 
     // Анимация
+    const clock = new THREE.Clock();
     const animate = () => {
       requestAnimationFrame(animate);
+      
+      const elapsedTime = clock.getElapsedTime();
+      
+      // Обновляем шейдер
+      if (shaderMaterial && shaderMaterial.uniforms.time) {
+        shaderMaterial.uniforms.time.value = elapsedTime;
+      }
+      
       orbitControls.update();
       renderer.render(scene, camera);
     };
@@ -543,138 +569,27 @@ function App() {
         </div>
       )}
       
-      <div className="controls-panel">
-        <h3 style={{ marginTop: 0 }}>Управление сценой</h3>
-        
-        {/* Загрузка моделей */}
-        <div className="control-section">
-          <h4>Загрузка модели</h4>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".gltf,.glb,.obj,.fbx"
-            onChange={handleFileSelect}
-            style={{ fontSize: '12px', marginBottom: '10px' }}
-          />
-          <p style={{ fontSize: '11px', color: '#aaa', margin: '5px 0' }}>
-            Поддерживаемые форматы: GLTF, GLB, OBJ, FBX
-          </p>
-        </div>
-
-        {/* Список объектов */}
-        <div className="control-section">
-          <h4>Объекты сцены</h4>
-          <select 
-            onChange={(e) => {
-              const obj = sceneObjects.find(o => o.id === e.target.value);
-              if (obj) handleObjectSelect(obj);
-            }}
-            value={selectedObject?.id || ''}
-            style={{ width: '100%', padding: '5px' }}
-          >
-            <option value="">Выберите объект</option>
-            {sceneObjects.map(obj => (
-              <option key={obj.id} value={obj.id}>{obj.name}</option>
-            ))}
-          </select>
-        </div>
-
-        {/* Трансформация выбранного объекта */}
-        {selectedObject && (
-          <div className="control-section">
-            <h4>Трансформация: {selectedObject.name}</h4>
-            
-            <div className="control-group">
-              <label>Режим:</label>
-              <div style={{ display: 'flex', gap: '5px', flexWrap: 'wrap' }}>
-                <button 
-                  onClick={() => setTransformMode('translate')}
-                  className={transformMode === 'translate' ? 'active' : ''}
-                  style={{ flex: '1 1 auto', padding: '5px', fontSize: '11px' }}
-                >
-                  Перемещение
-                </button>
-                <button 
-                  onClick={() => setTransformMode('rotate')}
-                  className={transformMode === 'rotate' ? 'active' : ''}
-                  style={{ flex: '1 1 auto', padding: '5px', fontSize: '11px' }}
-                >
-                  Поворот
-                </button>
-                <button 
-                  onClick={() => setTransformMode('scale')}
-                  className={transformMode === 'scale' ? 'active' : ''}
-                  style={{ flex: '1 1 auto', padding: '5px', fontSize: '11px' }}
-                >
-                  Масштаб
-                </button>
-              </div>
-            </div>
-
-            <div className="control-group">
-              <label>Позиция:</label>
-              <div className="transform-inputs">
-                <input type="number" step="0.1" value={position.x} onChange={(e) => updatePosition('x', parseFloat(e.target.value))} placeholder="X" />
-                <input type="number" step="0.1" value={position.y} onChange={(e) => updatePosition('y', parseFloat(e.target.value))} placeholder="Y" />
-                <input type="number" step="0.1" value={position.z} onChange={(e) => updatePosition('z', parseFloat(e.target.value))} placeholder="Z" />
-              </div>
-            </div>
-
-            <div className="control-group">
-              <label>Поворот (градусы):</label>
-              <div className="transform-inputs">
-                <input type="number" step="1" value={rotation.x} onChange={(e) => updateRotation('x', parseFloat(e.target.value))} placeholder="X" />
-                <input type="number" step="1" value={rotation.y} onChange={(e) => updateRotation('y', parseFloat(e.target.value))} placeholder="Y" />
-                <input type="number" step="1" value={rotation.z} onChange={(e) => updateRotation('z', parseFloat(e.target.value))} placeholder="Z" />
-              </div>
-            </div>
-
-            <div className="control-group">
-              <label>Масштаб:</label>
-              <div className="transform-inputs">
-                <input type="number" step="0.1" value={scale.x} onChange={(e) => updateScale('x', parseFloat(e.target.value))} placeholder="X" />
-                <input type="number" step="0.1" value={scale.y} onChange={(e) => updateScale('y', parseFloat(e.target.value))} placeholder="Y" />
-                <input type="number" step="0.1" value={scale.z} onChange={(e) => updateScale('z', parseFloat(e.target.value))} placeholder="Z" />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Настройки освещения */}
-        <div className="control-section">
-          <h4>Освещение</h4>
-          
-          <div className="control-group">
-            <label>Интенсивность света: {lightIntensity.toFixed(1)}</label>
-            <input
-              type="range"
-              min="0"
-              max="3"
-              step="0.1"
-              value={lightIntensity}
-              onChange={(e) => setLightIntensity(parseFloat(e.target.value))}
-            />
-          </div>
-
-          <div className="control-group">
-            <label>Цвет света:</label>
-            <input
-              type="color"
-              value={lightColor}
-              onChange={(e) => setLightColor(e.target.value)}
-            />
-          </div>
-
-          <div className="control-group">
-            <label>Цвет пирамиды:</label>
-            <input
-              type="color"
-              value={objectColor}
-              onChange={(e) => setObjectColor(e.target.value)}
-            />
-          </div>
-        </div>
-      </div>
+      <ControlPanel
+        onFileSelect={handleFileSelect}
+        fileInputRef={fileInputRef}
+        sceneObjects={sceneObjects}
+        selectedObject={selectedObject}
+        onObjectSelect={handleObjectSelect}
+        transformMode={transformMode}
+        position={position}
+        rotation={rotation}
+        scale={scale}
+        onTransformModeChange={setTransformMode}
+        onPositionChange={updatePosition}
+        onRotationChange={updateRotation}
+        onScaleChange={updateScale}
+        lightIntensity={lightIntensity}
+        lightColor={lightColor}
+        objectColor={objectColor}
+        onLightIntensityChange={setLightIntensity}
+        onLightColorChange={setLightColor}
+        onObjectColorChange={setObjectColor}
+      />
     </div>
   );
 }
