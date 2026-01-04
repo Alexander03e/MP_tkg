@@ -1,19 +1,74 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
-import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
-import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
-import { ControlPanel } from './components/ControlPanel';
-import { createWaveShaderMaterial } from './shaders/waveShader';
 import './App.css';
 
-interface SceneObject {
-  id: string;
-  name: string;
-  mesh: THREE.Object3D;
+interface ColorPoint {
+  id: number;
+  rgb: { r: number; g: number; b: number };
+  lab: { l: number; a: number; b: number };
+  mesh: THREE.Mesh;
+}
+
+// Функции конвертации sRGB -> XYZ -> LAB
+function srgbToLinear(value: number): number {
+  if (value <= 0.04045) {
+    return value / 12.92;
+  }
+  return Math.pow((value + 0.055) / 1.055, 2.4);
+}
+
+function rgbToXyz(r: number, g: number, b: number): { x: number; y: number; z: number } {
+  // Нормализуем RGB (0-255) в (0-1)
+  const rLinear = srgbToLinear(r / 255);
+  const gLinear = srgbToLinear(g / 255);
+  const bLinear = srgbToLinear(b / 255);
+
+  // Преобразование в XYZ (D65)
+  const x = rLinear * 0.4124564 + gLinear * 0.3575761 + bLinear * 0.1804375;
+  const y = rLinear * 0.2126729 + gLinear * 0.7151522 + bLinear * 0.0721750;
+  const z = rLinear * 0.0193339 + gLinear * 0.1191920 + bLinear * 0.9503041;
+
+  return { x: x * 100, y: y * 100, z: z * 100 };
+}
+
+function xyzToLab(x: number, y: number, z: number): { l: number; a: number; b: number } {
+  // Reference white D65
+  const xn = 95.047;
+  const yn = 100.000;
+  const zn = 108.883;
+
+  const fx = labF(x / xn);
+  const fy = labF(y / yn);
+  const fz = labF(z / zn);
+
+  const l = 116 * fy - 16;
+  const a = 500 * (fx - fy);
+  const b = 200 * (fy - fz);
+
+  return { l, a, b };
+}
+
+function labF(t: number): number {
+  const delta = 6 / 29;
+  if (t > delta ** 3) {
+    return Math.pow(t, 1 / 3);
+  }
+  return t / (3 * delta ** 2) + 4 / 29;
+}
+
+function rgbToLab(r: number, g: number, b: number): { l: number; a: number; b: number } {
+  const xyz = rgbToXyz(r, g, b);
+  return xyzToLab(xyz.x, xyz.y, xyz.z);
+}
+
+// Вычисление ΔE76
+function deltaE76(lab1: { l: number; a: number; b: number }, lab2: { l: number; a: number; b: number }): number {
+  const dL = lab1.l - lab2.l;
+  const da = lab1.a - lab2.a;
+  const db = lab1.b - lab2.b;
+  return Math.sqrt(dL * dL + da * da + db * db);
 }
 
 function App() {
@@ -24,229 +79,22 @@ function App() {
     renderer: THREE.WebGLRenderer;
     orbitControls: OrbitControls;
     transformControls: TransformControls;
-    directionalLight: THREE.DirectionalLight;
-    pointLight: THREE.PointLight;
-    pyramid: THREE.Mesh;
     raycaster: THREE.Raycaster;
     mouse: THREE.Vector2;
-    objects: Map<string, SceneObject>;
   } | null>(null);
-  
-  const [lightIntensity, setLightIntensity] = useState(1);
-  const [lightColor, setLightColor] = useState('#ffffff');
-  const [objectColor, setObjectColor] = useState('#ff6b6b');
-  const [sceneObjects, setSceneObjects] = useState<SceneObject[]>([]);
-  const [selectedObject, setSelectedObject] = useState<SceneObject | null>(null);
-  const [transformMode, setTransformMode] = useState<'translate' | 'rotate' | 'scale'>('translate');
-  const [isDragging, setIsDragging] = useState(false);
-  
-  // Параметры выбранного объекта
-  const [position, setPosition] = useState({ x: 0, y: 0, z: 0 });
-  const [rotation, setRotation] = useState({ x: 0, y: 0, z: 0 });
-  const [scale, setScale] = useState({ x: 1, y: 1, z: 1 });
 
-  const objectIdCounter = useRef(0);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [colorPoints, setColorPoints] = useState<ColorPoint[]>([]);
+  const [inputRgb, setInputRgb] = useState({ r: 255, g: 0, b: 0 });
+  const [selectedPointId, setSelectedPointId] = useState<number | null>(null);
+  const pointIdCounter = useRef(0);
 
-  // Функция для добавления объекта в сцену
-  const addObjectToScene = useCallback((object: THREE.Object3D, name: string) => {
-    if (!sceneRef.current) return;
-
-    const id = `object-${objectIdCounter.current++}`;
-    object.userData.id = id;
-    object.userData.selectable = true;
-    
-    // Включаем тени
-    object.traverse((child) => {
-      if (child instanceof THREE.Mesh) {
-        child.castShadow = true;
-        child.receiveShadow = true;
-      }
-    });
-
-    sceneRef.current.scene.add(object);
-    
-    const sceneObj: SceneObject = { id, name, mesh: object };
-    sceneRef.current.objects.set(id, sceneObj);
-    
-    setSceneObjects(prev => [...prev, sceneObj]);
-  }, []);
-
-  // Загрузка модели из файла
-  const loadModelFromFile = useCallback((file: File) => {
-    if (!sceneRef.current) return;
-
-    const reader = new FileReader();
-    const extension = file.name.split('.').pop()?.toLowerCase();
-
-    reader.onload = (e) => {
-      const content = e.target?.result;
-      if (!content) {
-        alert('Ошибка чтения файла');
-        return;
-      }
-
-      try {
-        if (extension === 'gltf') {
-          // GLTF - текстовый формат
-          const loader = new GLTFLoader();
-          
-          // Настройка DRACOLoader для сжатых моделей
-          const dracoLoader = new DRACOLoader();
-          dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
-          dracoLoader.setDecoderConfig({ type: 'js' });
-          loader.setDRACOLoader(dracoLoader);
-          
-          const gltfData = JSON.parse(content as string);
-          loader.parse(JSON.stringify(gltfData), '', (gltf) => {
-            const model = gltf.scene;
-            model.position.set(0, 1, 0);
-            // Нормализуем размер модели
-            const box = new THREE.Box3().setFromObject(model);
-            const size = box.getSize(new THREE.Vector3());
-            const maxDim = Math.max(size.x, size.y, size.z);
-            const scale = 2 / maxDim;
-            model.scale.setScalar(scale);
-            addObjectToScene(model, file.name);
-            dracoLoader.dispose();
-          }, (error) => {
-            console.error('Ошибка парсинга GLTF:', error);
-            alert('Не удалось загрузить GLTF модель. Проверьте формат файла.');
-            dracoLoader.dispose();
-          });
-        } else if (extension === 'glb') {
-          // GLB - бинарный формат
-          const loader = new GLTFLoader();
-          
-          // Настройка DRACOLoader для сжатых моделей
-          const dracoLoader = new DRACOLoader();
-          dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
-          dracoLoader.setDecoderConfig({ type: 'js' });
-          loader.setDRACOLoader(dracoLoader);
-          
-          loader.parse(content as ArrayBuffer, '', (gltf) => {
-            const model = gltf.scene;
-            model.position.set(0, 1, 0);
-            // Нормализуем размер модели
-            const box = new THREE.Box3().setFromObject(model);
-            const size = box.getSize(new THREE.Vector3());
-            const maxDim = Math.max(size.x, size.y, size.z);
-            const scale = 2 / maxDim;
-            model.scale.setScalar(scale);
-            addObjectToScene(model, file.name);
-            dracoLoader.dispose();
-          }, (error) => {
-            console.error('Ошибка парсинга GLB:', error);
-            alert('Не удалось загрузить GLB модель. Проверьте формат файла.');
-            dracoLoader.dispose();
-          });
-        } else if (extension === 'obj') {
-          const loader = new OBJLoader();
-          const model = loader.parse(content as string);
-          model.position.set(0, 1, 0);
-          // Нормализуем размер модели
-          const box = new THREE.Box3().setFromObject(model);
-          const size = box.getSize(new THREE.Vector3());
-          const maxDim = Math.max(size.x, size.y, size.z);
-          const scale = 2 / maxDim;
-          model.scale.setScalar(scale);
-          addObjectToScene(model, file.name);
-        } else if (extension === 'fbx') {
-          const loader = new FBXLoader();
-          const model = loader.parse(content as ArrayBuffer, '');
-          model.position.set(0, 1, 0);
-          // Нормализуем размер модели
-          const box = new THREE.Box3().setFromObject(model);
-          const size = box.getSize(new THREE.Vector3());
-          const maxDim = Math.max(size.x, size.y, size.z);
-          const scale = 2 / maxDim;
-          model.scale.setScalar(scale);
-          addObjectToScene(model, file.name);
-        } else {
-          alert(`Неподдерживаемый формат: ${extension}`);
-        }
-      } catch (error) {
-        console.error('Ошибка загрузки модели:', error);
-        alert(`Не удалось загрузить модель. Ошибка: ${error instanceof Error ? error.message : 'Неизвестная ошибка'}`);
-      }
-    };
-
-    reader.onerror = () => {
-      alert('Ошибка чтения файла');
-    };
-
-    // Читаем файл в зависимости от формата
-    if (extension === 'obj' || extension === 'gltf') {
-      reader.readAsText(file);
-    } else if (extension === 'glb' || extension === 'fbx') {
-      reader.readAsArrayBuffer(file);
-    } else {
-      alert(`Неподдерживаемый формат файла: ${extension}`);
-    }
-  }, [addObjectToScene]);
-
-  // Обработка выбора файла
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      loadModelFromFile(files[0]);
-    }
-  };
-
-  // Обработка drag and drop
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = () => {
-    setIsDragging(false);
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    
-    const files = e.dataTransfer.files;
-    if (files && files.length > 0) {
-      loadModelFromFile(files[0]);
-    }
-  };
-
-  // Выбор объекта из списка
-  const handleObjectSelect = useCallback((obj: SceneObject) => {
-    if (!sceneRef.current) return;
-    
-    setSelectedObject(obj);
-    sceneRef.current.transformControls.attach(obj.mesh);
-    
-    // Обновляем параметры трансформации
-    setPosition({
-      x: parseFloat(obj.mesh.position.x.toFixed(2)),
-      y: parseFloat(obj.mesh.position.y.toFixed(2)),
-      z: parseFloat(obj.mesh.position.z.toFixed(2))
-    });
-    
-    setRotation({
-      x: parseFloat((obj.mesh.rotation.x * 180 / Math.PI).toFixed(2)),
-      y: parseFloat((obj.mesh.rotation.y * 180 / Math.PI).toFixed(2)),
-      z: parseFloat((obj.mesh.rotation.z * 180 / Math.PI).toFixed(2))
-    });
-    
-    setScale({
-      x: parseFloat(obj.mesh.scale.x.toFixed(2)),
-      y: parseFloat(obj.mesh.scale.y.toFixed(2)),
-      z: parseFloat(obj.mesh.scale.z.toFixed(2))
-    });
-  }, []);
-
-  // Создание сцены один раз
+  // Создание сцены
   useEffect(() => {
     if (!containerRef.current) return;
     const container = containerRef.current;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x1a1a2e);
+    scene.background = new THREE.Color(0xf0f0f0);
 
     const camera = new THREE.PerspectiveCamera(
       75,
@@ -254,169 +102,160 @@ function App() {
       0.1,
       1000
     );
-    camera.position.set(5, 5, 5);
+    camera.position.set(150, 150, 150);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(renderer.domElement);
 
+    // OrbitControls
     const orbitControls = new OrbitControls(camera, renderer.domElement);
     orbitControls.enableDamping = true;
     orbitControls.dampingFactor = 0.05;
 
     // TransformControls
     const transformControls = new TransformControls(camera, renderer.domElement);
-    transformControls.addEventListener('dragging-changed', (event) => {
-      orbitControls.enabled = !event.value;
-    });
-    
-    transformControls.addEventListener('change', () => {
-      if (selectedObject) {
-        setPosition({
-          x: parseFloat(selectedObject.mesh.position.x.toFixed(2)),
-          y: parseFloat(selectedObject.mesh.position.y.toFixed(2)),
-          z: parseFloat(selectedObject.mesh.position.z.toFixed(2))
-        });
-        setRotation({
-          x: parseFloat((selectedObject.mesh.rotation.x * 180 / Math.PI).toFixed(2)),
-          y: parseFloat((selectedObject.mesh.rotation.y * 180 / Math.PI).toFixed(2)),
-          z: parseFloat((selectedObject.mesh.rotation.z * 180 / Math.PI).toFixed(2))
-        });
-        setScale({
-          x: parseFloat(selectedObject.mesh.scale.x.toFixed(2)),
-          y: parseFloat(selectedObject.mesh.scale.y.toFixed(2)),
-          z: parseFloat(selectedObject.mesh.scale.z.toFixed(2))
-        });
-      }
-    });
-    
+    transformControls.setMode('translate');
+    transformControls.setSpace('world');
+    transformControls.setSize(5); // МАКСИМАЛЬНО увеличиваем размер
     scene.add(transformControls as unknown as THREE.Object3D);
+    
+    console.log('TransformControls added to scene');
+
+    let isDragging = false;
+
+    // Отключаем OrbitControls при использовании TransformControls
+    transformControls.addEventListener('dragging-changed', (event) => {
+      const value = (event as { value: unknown }).value;
+      const isDraggingValue = typeof value === 'boolean' ? value : false;
+      orbitControls.enabled = !isDraggingValue;
+      isDragging = isDraggingValue;
+      console.log('Dragging:', isDraggingValue);
+    });
+
+    // Событие изменения объекта
+    transformControls.addEventListener('objectChange', () => {
+      console.log('Object changed');
+    });
+
+    // Освещение
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.4);
+    directionalLight.position.set(100, 100, 100);
+    scene.add(directionalLight);
+
+    // Создание текстовой метки
+    const createTextLabel = (text: string, x: number, y: number, z: number) => {
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      if (!context) return;
+
+      canvas.width = 128;
+      canvas.height = 128;
+
+      context.fillStyle = '#000000';
+      context.font = 'Bold 80px Arial';
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.fillText(text, 64, 64);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      const spriteMaterial = new THREE.SpriteMaterial({ map: texture });
+      const sprite = new THREE.Sprite(spriteMaterial);
+      sprite.position.set(x, y, z);
+      sprite.scale.set(10, 10, 1);
+      scene.add(sprite);
+    };
+
+    // Создание осей с подписями
+    const createAxes = () => {
+      const axisLength = 120;
+      const axisRadius = 0.5;
+
+      // Ось L (вертикальная, зеленая)
+      const lGeometry = new THREE.CylinderGeometry(axisRadius, axisRadius, axisLength, 16);
+      const lMaterial = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+      const lAxis = new THREE.Mesh(lGeometry, lMaterial);
+      lAxis.position.set(0, axisLength / 2, 0);
+      scene.add(lAxis);
+
+      // Ось a (красная)
+      const aGeometry = new THREE.CylinderGeometry(axisRadius, axisRadius, axisLength * 2, 16);
+      const aMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+      const aAxis = new THREE.Mesh(aGeometry, aMaterial);
+      aAxis.rotation.z = Math.PI / 2;
+      aAxis.position.set(0, 0, 0);
+      scene.add(aAxis);
+
+      // Ось b (синяя)
+      const bGeometry = new THREE.CylinderGeometry(axisRadius, axisRadius, axisLength * 2, 16);
+      const bMaterial = new THREE.MeshBasicMaterial({ color: 0x0000ff });
+      const bAxis = new THREE.Mesh(bGeometry, bMaterial);
+      bAxis.rotation.x = Math.PI / 2;
+      bAxis.position.set(0, 0, 0);
+      scene.add(bAxis);
+
+      // Текстовые подписи (используем спрайты)
+      createTextLabel('L', 0, axisLength + 5, 0);
+      createTextLabel('a', axisLength + 10, 0, 0);
+      createTextLabel('b', 0, 0, axisLength + 10);
+    };
+
+    // Создание сетки границ sRGB
+    const createSRGBGrid = () => {
+      const step = 5;
+      const points: THREE.Vector3[] = [];
+      const colors: THREE.Color[] = [];
+
+      for (let r = 0; r <= 255; r += step) {
+        for (let g = 0; g <= 255; g += step) {
+          for (let b = 0; b <= 255; b += step) {
+            // Отображаем только граничные точки (хотя бы одна координата 0 или 255)
+            if (
+              r === 0 || r === 255 ||
+              g === 0 || g === 255 ||
+              b === 0 || b === 255
+            ) {
+              const lab = rgbToLab(r, g, b);
+              points.push(new THREE.Vector3(lab.a, lab.l, lab.b));
+              colors.push(new THREE.Color(r / 255, g / 255, b / 255));
+            }
+          }
+        }
+      }
+
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const colorArray = new Float32Array(colors.length * 3);
+      colors.forEach((color, i) => {
+        colorArray[i * 3] = color.r;
+        colorArray[i * 3 + 1] = color.g;
+        colorArray[i * 3 + 2] = color.b;
+      });
+      geometry.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
+
+      const material = new THREE.PointsMaterial({
+        size: 2,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.4,
+      });
+
+      const pointCloud = new THREE.Points(geometry, material);
+      scene.add(pointCloud);
+    };
+
+    // Создание осей LAB
+    createAxes();
+
+    // Создание сетки границ sRGB
+    createSRGBGrid();
 
     // Raycaster для выбора объектов
     const raycaster = new THREE.Raycaster();
+    raycaster.params.Points = { threshold: 1 };
     const mouse = new THREE.Vector2();
-
-    // Источники света
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
-    directionalLight.position.set(5, 10, 5);
-    directionalLight.castShadow = true;
-    directionalLight.shadow.camera.left = -10;
-    directionalLight.shadow.camera.right = 10;
-    directionalLight.shadow.camera.top = 10;
-    directionalLight.shadow.camera.bottom = -10;
-    scene.add(directionalLight);
-
-    const pointLight = new THREE.PointLight(0xff9500, 1, 50);
-    pointLight.position.set(-3, 3, -3);
-    pointLight.castShadow = true;
-    scene.add(pointLight);
-
-    const ambientLight = new THREE.AmbientLight(0x404040, 0.5);
-    scene.add(ambientLight);
-
-    // Плоскость
-    const planeGeometry = new THREE.BufferGeometry();
-    const planeVertices = new Float32Array([
-      -5, 0, -5, 5, 0, -5, 5, 0, 5,
-      -5, 0, -5, 5, 0, 5, -5, 0, 5,
-    ]);
-    planeGeometry.setAttribute('position', new THREE.BufferAttribute(planeVertices, 3));
-    planeGeometry.computeVertexNormals();
-    
-    const planeMaterial = new THREE.MeshStandardMaterial({ 
-      color: 0x2c3e50,
-      side: THREE.DoubleSide 
-    });
-    const plane = new THREE.Mesh(planeGeometry, planeMaterial);
-    plane.receiveShadow = true;
-    plane.userData.selectable = false;
-    scene.add(plane);
-
-    // Треугольная пирамида
-    const pyramidGeometry = new THREE.BufferGeometry();
-    const pyramidVertices = new Float32Array([
-      0, 0, 0, 1, 0, 0, 0.5, 0, 0.866,
-      0, 0, 0, 0.5, 1, 0.433, 1, 0, 0,
-      1, 0, 0, 0.5, 1, 0.433, 0.5, 0, 0.866,
-      0.5, 0, 0.866, 0.5, 1, 0.433, 0, 0, 0,
-    ]);
-    pyramidGeometry.setAttribute('position', new THREE.BufferAttribute(pyramidVertices, 3));
-    pyramidGeometry.computeVertexNormals();
-    
-    const pyramidMaterial = new THREE.MeshStandardMaterial({ color: 0xff6b6b });
-    const pyramid = new THREE.Mesh(pyramidGeometry, pyramidMaterial);
-    pyramid.position.set(-2, 0, -2);
-    pyramid.castShadow = true;
-    pyramid.receiveShadow = true;
-    pyramid.userData.selectable = true;
-    pyramid.userData.id = 'pyramid';
-    scene.add(pyramid);
-
-    // Куб с текстурой
-    const textureLoader = new THREE.TextureLoader();
-    const texture = textureLoader.load(
-      '/src/assets/image.png',
-      () => {
-        texture.wrapS = THREE.RepeatWrapping;
-        texture.wrapT = THREE.RepeatWrapping;
-        texture.repeat.set(4, 4);
-      }
-    );
-    
-    const cubeGeometry = new THREE.BoxGeometry(1.5, 1.5, 1.5);
-    const cubeMaterial = new THREE.MeshStandardMaterial({ 
-      map: texture,
-      color: 0xffffff
-    });
-    const cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
-    cube.position.set(2, 1, 0);
-    cube.castShadow = true;
-    cube.receiveShadow = true;
-    cube.userData.selectable = true;
-    cube.userData.id = 'cube';
-    scene.add(cube);
-
-    // Сфера
-    const sphereGeometry = new THREE.SphereGeometry(0.8, 32, 32);
-    const sphereMaterial = new THREE.MeshStandardMaterial({ 
-      color: 0x4ecdc4,
-      metalness: 0.5,
-      roughness: 0.2
-    });
-    const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
-    sphere.position.set(0, 2, 2);
-    sphere.castShadow = true;
-    sphere.receiveShadow = true;
-    sphere.userData.selectable = true;
-    sphere.userData.id = 'sphere';
-    scene.add(sphere);
-
-    // Плоскость с кастомным GLSL шейдером (волновой эффект)
-    const shaderPlaneGeometry = new THREE.PlaneGeometry(3, 3, 50, 50);
-    const shaderMaterial = createWaveShaderMaterial();
-    const shaderPlane = new THREE.Mesh(shaderPlaneGeometry, shaderMaterial);
-    shaderPlane.rotation.x = -Math.PI / 2;
-    shaderPlane.position.set(0, 0.5, -3);
-    shaderPlane.castShadow = true;
-    shaderPlane.receiveShadow = true;
-    shaderPlane.userData.selectable = true;
-    shaderPlane.userData.id = 'shader-plane';
-    shaderPlane.userData.isShader = true;
-    scene.add(shaderPlane);
-
-    // Инициализация объектов
-    const objects = new Map<string, SceneObject>();
-    const pyramidObj = { id: 'pyramid', name: 'Пирамида', mesh: pyramid };
-    const cubeObj = { id: 'cube', name: 'Куб', mesh: cube };
-    const sphereObj = { id: 'sphere', name: 'Сфера', mesh: sphere };
-    const shaderPlaneObj = { id: 'shader-plane', name: 'Волновая плоскость (GLSL)', mesh: shaderPlane };
-    
-    objects.set('pyramid', pyramidObj);
-    objects.set('cube', cubeObj);
-    objects.set('sphere', sphereObj);
-    objects.set('shader-plane', shaderPlaneObj);
 
     sceneRef.current = {
       scene,
@@ -424,61 +263,13 @@ function App() {
       renderer,
       orbitControls,
       transformControls,
-      directionalLight,
-      pointLight,
-      pyramid,
       raycaster,
       mouse,
-      objects
     };
-    
-    // Обновляем список объектов после монтирования
-    queueMicrotask(() => {
-      setSceneObjects([pyramidObj, cubeObj, sphereObj, shaderPlaneObj]);
-    });
-
-    // Обработка кликов по объектам
-    const handleClick = (event: MouseEvent) => {
-      if (!sceneRef.current) return;
-
-      const rect = renderer.domElement.getBoundingClientRect();
-      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-      raycaster.setFromCamera(mouse, camera);
-      const intersects = raycaster.intersectObjects(scene.children, true);
-
-      for (const intersect of intersects) {
-        let obj = intersect.object;
-        while (obj.parent && obj.parent.type !== 'Scene') {
-          if (obj.userData.selectable) break;
-          obj = obj.parent;
-        }
-
-        if (obj.userData.selectable && obj.userData.id) {
-          const sceneObj = sceneRef.current.objects.get(obj.userData.id);
-          if (sceneObj) {
-            handleObjectSelect(sceneObj);
-            return;
-          }
-        }
-      }
-    };
-
-    renderer.domElement.addEventListener('click', handleClick);
 
     // Анимация
-    const clock = new THREE.Clock();
     const animate = () => {
       requestAnimationFrame(animate);
-      
-      const elapsedTime = clock.getElapsedTime();
-      
-      // Обновляем шейдер
-      if (shaderMaterial && shaderMaterial.uniforms.time) {
-        shaderMaterial.uniforms.time.value = elapsedTime;
-      }
-      
       orbitControls.update();
       renderer.render(scene, camera);
     };
@@ -492,104 +283,408 @@ function App() {
     };
     window.addEventListener('resize', handleResize);
 
+    // Обработка кликов для выбора точек
+    const handleClick = (event: MouseEvent) => {
+      // Игнорируем клики когда используем TransformControls
+      if (isDragging) {
+        console.log('Ignoring click - dragging');
+        return;
+      }
+      
+      if (!sceneRef.current) return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      
+      const selectableObjects = scene.children.filter(
+        (obj) => obj.userData.selectable === true
+      );
+      
+      console.log('Selectable objects:', selectableObjects.length);
+      
+      const intersects = raycaster.intersectObjects(selectableObjects, true);
+      
+      console.log('Intersects:', intersects.length);
+
+      if (intersects.length > 0) {
+        const clickedObject = intersects[0].object;
+        console.log('Clicked object:', clickedObject.userData);
+        if (clickedObject.userData.colorPointId !== undefined) {
+          console.log('Attaching to object:', clickedObject.userData.colorPointId);
+          
+          // Сбрасываем масштаб у всех сфер
+          scene.children.forEach((obj) => {
+            if (obj.userData.selectable && obj instanceof THREE.Mesh) {
+              obj.scale.set(1, 1, 1);
+            }
+          });
+          
+          // Увеличиваем выбранную сферу
+          if (clickedObject instanceof THREE.Mesh) {
+            clickedObject.scale.set(1.3, 1.3, 1.3);
+          }
+          
+          // Устанавливаем выбранную точку
+          setSelectedPointId(clickedObject.userData.colorPointId);
+          
+          transformControls.attach(clickedObject as THREE.Object3D);
+          console.log('Transform controls attached:', transformControls.object !== undefined);
+          console.log('Attached object position:', clickedObject.position);
+          console.log('Camera position:', camera.position);
+        }
+      } else {
+        console.log('Detaching controls');
+        // Сбрасываем масштаб у всех сфер
+        scene.children.forEach((obj) => {
+          if (obj.userData.selectable && obj instanceof THREE.Mesh) {
+            obj.scale.set(1, 1, 1);
+          }
+        });
+        setSelectedPointId(null);
+        transformControls.detach();
+      }
+    };
+
+    renderer.domElement.addEventListener('click', handleClick);
+
+    // Обработка наведения курсора для подсветки
+    const handleMouseMove = (event: MouseEvent) => {
+      if (isDragging) return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      
+      const selectableObjects = scene.children.filter(
+        (obj) => obj.userData.selectable === true
+      );
+      
+      const intersects = raycaster.intersectObjects(selectableObjects, true);
+
+      // Меняем курсор
+      renderer.domElement.style.cursor = intersects.length > 0 ? 'pointer' : 'default';
+    };
+
+    renderer.domElement.addEventListener('mousemove', handleMouseMove);
+
+    // Обработка нажатия Escape для снятия выделения
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        // Сбрасываем масштаб у всех сфер
+        scene.children.forEach((obj) => {
+          if (obj.userData.selectable && obj instanceof THREE.Mesh) {
+            obj.scale.set(1, 1, 1);
+          }
+        });
+        setSelectedPointId(null);
+        transformControls.detach();
+        console.log('Controls detached by Escape');
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+
     // Очистка
     return () => {
       window.removeEventListener('resize', handleResize);
+      window.removeEventListener('keydown', handleKeyDown);
       renderer.domElement.removeEventListener('click', handleClick);
+      renderer.domElement.removeEventListener('mousemove', handleMouseMove);
       if (container && renderer.domElement.parentNode === container) {
         container.removeChild(renderer.domElement);
       }
       renderer.dispose();
       sceneRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Обновление параметров света
-  useEffect(() => {
+  // Добавление цветовой точки
+  const addColorPoint = () => {
+    if (colorPoints.length >= 4) {
+      alert('Максимум 4 точки!');
+      return;
+    }
+
     if (!sceneRef.current) return;
 
-    sceneRef.current.directionalLight.intensity = lightIntensity;
-    sceneRef.current.pointLight.intensity = lightIntensity;
-    
-    const color = new THREE.Color(lightColor);
-    sceneRef.current.directionalLight.color = color;
-    
-    const objColor = new THREE.Color(objectColor);
-    (sceneRef.current.pyramid.material as THREE.MeshStandardMaterial).color = objColor;
-  }, [lightIntensity, lightColor, objectColor]);
+    const { r, g, b } = inputRgb;
+    const lab = rgbToLab(r, g, b);
 
-  // Обновление режима трансформации
+    console.log('Creating point:', { r, g, b, lab });
+
+    // Создаем сферу
+    const geometry = new THREE.SphereGeometry(5, 32, 32);
+    const material = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(r / 255, g / 255, b / 255),
+      metalness: 0.3,
+      roughness: 0.4,
+    });
+    const sphere = new THREE.Mesh(geometry, material);
+    sphere.position.set(lab.a, lab.l, lab.b);
+    sphere.userData.selectable = true;
+    sphere.userData.colorPointId = pointIdCounter.current;
+    sphere.castShadow = true;
+    sphere.receiveShadow = true;
+
+    sceneRef.current.scene.add(sphere);
+    
+    console.log('Sphere added to scene, ID:', pointIdCounter.current);
+
+    const newPoint: ColorPoint = {
+      id: pointIdCounter.current++,
+      rgb: { r, g, b },
+      lab,
+      mesh: sphere,
+    };
+
+    setColorPoints((prev) => [...prev, newPoint]);
+  };
+
+  // Удаление цветовой точки
+  const removeColorPoint = (id: number) => {
+    if (!sceneRef.current) return;
+
+    const point = colorPoints.find((p) => p.id === id);
+    if (point) {
+      sceneRef.current.scene.remove(point.mesh);
+      if (sceneRef.current.transformControls.object === point.mesh) {
+        sceneRef.current.transformControls.detach();
+      }
+    }
+
+    setColorPoints((prev) => prev.filter((p) => p.id !== id));
+    if (selectedPointId === id) {
+      setSelectedPointId(null);
+    }
+  };
+
+  // Перемещение точки по осям LAB
+  const movePoint = (axis: 'l' | 'a' | 'b', delta: number) => {
+    if (selectedPointId === null || !sceneRef.current) return;
+
+    const point = colorPoints.find((p) => p.id === selectedPointId);
+    if (!point) return;
+
+    // Обновляем позицию в LAB
+    const newLab = { ...point.lab };
+    if (axis === 'l') newLab.l += delta;
+    if (axis === 'a') newLab.a += delta;
+    if (axis === 'b') newLab.b += delta;
+
+    // Ограничиваем значения LAB
+    newLab.l = Math.max(0, Math.min(100, newLab.l));
+    newLab.a = Math.max(-128, Math.min(127, newLab.a));
+    newLab.b = Math.max(-128, Math.min(127, newLab.b));
+
+    // Обновляем позицию меша
+    point.mesh.position.set(newLab.a, newLab.l, newLab.b);
+    point.lab = newLab;
+
+    // Обновляем состояние для перерисовки линий
+    setColorPoints((prev) => [...prev]);
+  };
+
+  // Обновление линий между точками
   useEffect(() => {
     if (!sceneRef.current) return;
-    sceneRef.current.transformControls.setMode(transformMode);
-  }, [transformMode]);
+    const scene = sceneRef.current.scene;
 
-  // Обновление позиции объекта из input
-  const updatePosition = (axis: 'x' | 'y' | 'z', value: number) => {
-    if (!selectedObject || !sceneRef.current) return;
-    const obj = sceneRef.current.objects.get(selectedObject.id);
-    if (obj) {
-      obj.mesh.position[axis] = value;
-      setPosition(prev => ({ ...prev, [axis]: value }));
+    // Удаляем старые линии
+    const oldLines = scene.children.filter((obj) => obj.userData.isConnectionLine);
+    oldLines.forEach((line) => scene.remove(line));
+
+    // Создаем новые линии между всеми парами точек
+    for (let i = 0; i < colorPoints.length; i++) {
+      for (let j = i + 1; j < colorPoints.length; j++) {
+        const point1 = colorPoints[i];
+        const point2 = colorPoints[j];
+
+        const points = [
+          new THREE.Vector3(point1.lab.a, point1.lab.l, point1.lab.b),
+          new THREE.Vector3(point2.lab.a, point2.lab.l, point2.lab.b),
+        ];
+
+        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        const material = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 });
+        const line = new THREE.Line(geometry, material);
+        line.userData.isConnectionLine = true;
+        scene.add(line);
+      }
     }
+  }, [colorPoints]);
+
+  // Вычисление таблицы ΔE76
+  const calculateDeltaETable = () => {
+    const table: { pair: string; deltaE: number }[] = [];
+
+    for (let i = 0; i < colorPoints.length; i++) {
+      for (let j = i + 1; j < colorPoints.length; j++) {
+        const point1 = colorPoints[i];
+        const point2 = colorPoints[j];
+        const dE = deltaE76(point1.lab, point2.lab);
+        table.push({
+          pair: `Точка ${i + 1} - Точка ${j + 1}`,
+          deltaE: parseFloat(dE.toFixed(2)),
+        });
+      }
+    }
+
+    return table;
   };
 
-  // Обновление поворота объекта из input (в градусах)
-  const updateRotation = (axis: 'x' | 'y' | 'z', value: number) => {
-    if (!selectedObject || !sceneRef.current) return;
-    const obj = sceneRef.current.objects.get(selectedObject.id);
-    if (obj) {
-      obj.mesh.rotation[axis] = value * Math.PI / 180;
-      setRotation(prev => ({ ...prev, [axis]: value }));
-    }
-  };
-
-  // Обновление масштаба объекта из input
-  const updateScale = (axis: 'x' | 'y' | 'z', value: number) => {
-    if (!selectedObject || !sceneRef.current) return;
-    const obj = sceneRef.current.objects.get(selectedObject.id);
-    if (obj) {
-      obj.mesh.scale[axis] = value;
-      setScale(prev => ({ ...prev, [axis]: value }));
-    }
-  };
+  const deltaETable = calculateDeltaETable();
 
   return (
-    <div 
-      className="scene-container" 
-      ref={containerRef}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
-    >
-      {isDragging && (
-        <div className="drag-overlay">
-          <p>Отпустите файл для загрузки модели</p>
-        </div>
-      )}
+    <div className="app-container">
+      <div className="scene-container" ref={containerRef}></div>
       
-      <ControlPanel
-        onFileSelect={handleFileSelect}
-        fileInputRef={fileInputRef}
-        sceneObjects={sceneObjects}
-        selectedObject={selectedObject}
-        onObjectSelect={handleObjectSelect}
-        transformMode={transformMode}
-        position={position}
-        rotation={rotation}
-        scale={scale}
-        onTransformModeChange={setTransformMode}
-        onPositionChange={updatePosition}
-        onRotationChange={updateRotation}
-        onScaleChange={updateScale}
-        lightIntensity={lightIntensity}
-        lightColor={lightColor}
-        objectColor={objectColor}
-        onLightIntensityChange={setLightIntensity}
-        onLightColorChange={setLightColor}
-        onObjectColorChange={setObjectColor}
-      />
+      <div className="controls-panel">
+        <h3>3D-визуализатор sRGB в CIELAB</h3>
+        
+    
+        {selectedPointId !== null && (
+          <div className="control-group" style={{ padding: '12px', backgroundColor: 'rgba(255, 215, 0, 0.2)', border: '2px solid rgba(255, 215, 0, 0.6)', borderRadius: '6px' }}>
+            <h4 style={{ margin: '0 0 10px 0', color: '#ff6b00' }}>🎯 Управление точкой {colorPoints.findIndex(p => p.id === selectedPointId) + 1}</h4>
+            
+            <div style={{ marginBottom: '8px' }}>
+              <strong>Ось L (яркость):</strong>
+              <div style={{ display: 'flex', gap: '5px', marginTop: '5px' }}>
+                <button onClick={() => movePoint('l', -5)} style={{ flex: 1 }}>L -5</button>
+                <button onClick={() => movePoint('l', -1)} style={{ flex: 1 }}>L -1</button>
+                <button onClick={() => movePoint('l', 1)} style={{ flex: 1 }}>L +1</button>
+                <button onClick={() => movePoint('l', 5)} style={{ flex: 1 }}>L +5</button>
+              </div>
+            </div>
+
+            <div style={{ marginBottom: '8px' }}>
+              <strong>Ось a (красный-зеленый):</strong>
+              <div style={{ display: 'flex', gap: '5px', marginTop: '5px' }}>
+                <button onClick={() => movePoint('a', -5)} style={{ flex: 1 }}>a -5</button>
+                <button onClick={() => movePoint('a', -1)} style={{ flex: 1 }}>a -1</button>
+                <button onClick={() => movePoint('a', 1)} style={{ flex: 1 }}>a +1</button>
+                <button onClick={() => movePoint('a', 5)} style={{ flex: 1 }}>a +5</button>
+              </div>
+            </div>
+
+            <div style={{ marginBottom: '8px' }}>
+              <strong>Ось b (желтый-синий):</strong>
+              <div style={{ display: 'flex', gap: '5px', marginTop: '5px' }}>
+                <button onClick={() => movePoint('b', -5)} style={{ flex: 1 }}>b -5</button>
+                <button onClick={() => movePoint('b', -1)} style={{ flex: 1 }}>b -1</button>
+                <button onClick={() => movePoint('b', 1)} style={{ flex: 1 }}>b +1</button>
+                <button onClick={() => movePoint('b', 5)} style={{ flex: 1 }}>b +5</button>
+              </div>
+            </div>
+
+            <div style={{ fontSize: '10px', marginTop: '8px', padding: '5px', backgroundColor: 'rgba(0,0,0,0.1)', borderRadius: '3px' }}>
+              LAB: L={colorPoints.find(p => p.id === selectedPointId)?.lab.l.toFixed(1)}, 
+              a={colorPoints.find(p => p.id === selectedPointId)?.lab.a.toFixed(1)}, 
+              b={colorPoints.find(p => p.id === selectedPointId)?.lab.b.toFixed(1)}
+            </div>
+          </div>
+        )}
+
+        <div className="control-group">
+          <h4>Добавить точку ({colorPoints.length}/4)</h4>
+          <div style={{ display: 'flex', gap: '10px', marginBottom: '10px' }}>
+            <div>
+              <label>R:</label>
+              <input
+                type="number"
+                min="0"
+                max="255"
+                value={inputRgb.r}
+                onChange={(e) => setInputRgb({ ...inputRgb, r: Number(e.target.value) })}
+                style={{ width: '60px' }}
+              />
+            </div>
+            <div>
+              <label>G:</label>
+              <input
+                type="number"
+                min="0"
+                max="255"
+                value={inputRgb.g}
+                onChange={(e) => setInputRgb({ ...inputRgb, g: Number(e.target.value) })}
+                style={{ width: '60px' }}
+              />
+            </div>
+            <div>
+              <label>B:</label>
+              <input
+                type="number"
+                min="0"
+                max="255"
+                value={inputRgb.b}
+                onChange={(e) => setInputRgb({ ...inputRgb, b: Number(e.target.value) })}
+                style={{ width: '60px' }}
+              />
+            </div>
+          </div>
+          <div
+            style={{
+              width: '100%',
+              height: '30px',
+              backgroundColor: `rgb(${inputRgb.r}, ${inputRgb.g}, ${inputRgb.b})`,
+              border: '1px solid #ccc',
+              marginBottom: '10px',
+            }}
+          />
+          <button onClick={addColorPoint} disabled={colorPoints.length >= 4}>
+            Добавить точку
+          </button>
+        </div>
+
+        <div className="control-group">
+          <h4>Точки цветов</h4>
+          {colorPoints.map((point, index) => (
+            <div key={point.id} style={{ marginBottom: '10px', padding: '10px', border: '1px solid #ccc' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span>Точка {index + 1}</span>
+                <button onClick={() => removeColorPoint(point.id)}>Удалить</button>
+              </div>
+              <div style={{ fontSize: '12px', marginTop: '5px' }}>
+                <div>RGB: ({point.rgb.r}, {point.rgb.g}, {point.rgb.b})</div>
+                <div>LAB: (L={point.lab.l.toFixed(2)}, a={point.lab.a.toFixed(2)}, b={point.lab.b.toFixed(2)})</div>
+              </div>
+              <div
+                style={{
+                  width: '100%',
+                  height: '20px',
+                  backgroundColor: `rgb(${point.rgb.r}, ${point.rgb.g}, ${point.rgb.b})`,
+                  marginTop: '5px',
+                }}
+              />
+            </div>
+          ))}
+        </div>
+
+        {deltaETable.length > 0 && (
+          <div className="control-group">
+            <h4>Таблица ΔE76</h4>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr>
+                  <th style={{ border: '1px solid #ccc', padding: '5px' }}>Пара точек</th>
+                  <th style={{ border: '1px solid #ccc', padding: '5px' }}>ΔE76</th>
+                </tr>
+              </thead>
+              <tbody>
+                {deltaETable.map((row, index) => (
+                  <tr key={index}>
+                    <td style={{ border: '1px solid #ccc', padding: '5px' }}>{row.pair}</td>
+                    <td style={{ border: '1px solid #ccc', padding: '5px' }}>{row.deltaE}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
