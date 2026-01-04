@@ -357,7 +357,7 @@ function App() {
     // Куб с текстурой
     const textureLoader = new THREE.TextureLoader();
     const texture = textureLoader.load(
-      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAG0lEQVQYV2NkYGD4z8DAwMgABXAGjgGmJgYGADhKAwWcQXKCAAAAAElFTkSuQmCC',
+      '/src/assets/image.png',
       () => {
         texture.wrapS = THREE.RepeatWrapping;
         texture.wrapT = THREE.RepeatWrapping;
